@@ -1969,9 +1969,94 @@
     return valid[0].product;
   }
 
+  function getSectionTitleById(sectionId) {
+    if (!sectionId) return null;
+    if (allCatalogData?.sections?.length) {
+      const section = allCatalogData.sections.find(s => String(s.id) === String(sectionId));
+      if (section?.title) return section.title;
+    }
+    if (newMaterialSectionInput) {
+      const option = newMaterialSectionInput.querySelector(`option[value="${sectionId}"]`);
+      if (option && option.textContent) {
+        return option.textContent.trim();
+      }
+    }
+    return null;
+  }
+
+  function getRegistryPriceForProduct(sectionId, areaCm2, candidateNames = []) {
+    if (!sectionId || !isFinite(areaCm2) || areaCm2 <= 0) return null;
+    if (typeof extractPriceRowsFromRegistry !== 'function' || typeof findPrecioBasePorM2 !== 'function') {
+      return null;
+    }
+
+    const sectionTitle = getSectionTitleById(sectionId);
+    if (!sectionTitle) return null;
+
+    try {
+      const registros = extractPriceRowsFromRegistry(sectionTitle);
+      if (!registros || !registros.length) return null;
+
+      const normalizedCandidates = [...new Set(
+        candidateNames
+          .map(name => (name || '').split('(')[0].trim())
+          .filter(Boolean)
+      )];
+
+      for (const candidate of normalizedCandidates) {
+        try {
+          const precio = findPrecioBasePorM2(candidate, areaCm2, registros);
+          if (isFinite(precio)) {
+            return precio;
+          }
+        } catch (err) {
+          console.debug(`findPrecioBasePorM2 sin coincidencia para "${candidate}"`, err?.message || err);
+        }
+      }
+
+      // Último recurso: evaluar todos los registros ignorando el nombre del producto
+      const genericMatches = registros.filter(r => {
+        if (r.tipoRango === 'DESDE') {
+          return areaCm2 >= r.areaRef;
+        }
+        if (r.tipoRango === 'HASTA') {
+          return areaCm2 <= r.areaRef;
+        }
+        return false;
+      });
+      if (genericMatches.length > 0) {
+        genericMatches.sort((a, b) => {
+          if (a.tipoRango === 'HASTA' && b.tipoRango !== 'HASTA') return -1;
+          if (a.tipoRango !== 'HASTA' && b.tipoRango === 'HASTA') return 1;
+          if (a.tipoRango === 'HASTA' && b.tipoRango === 'HASTA') {
+            return a.areaRef - b.areaRef;
+          }
+          if (a.tipoRango === 'DESDE' && b.tipoRango === 'DESDE') {
+            return b.areaRef - a.areaRef;
+          }
+          return Math.abs(a.areaRef - areaCm2) - Math.abs(b.areaRef - areaCm2);
+        });
+        return genericMatches[0].precioM2;
+      }
+    } catch (err) {
+      console.debug('getRegistryPriceForProduct: error al leer registros', err?.message || err);
+    }
+    return null;
+  }
+
     // --- CORRECCIÓN: La función ahora busca el mejor producto automáticamente ---
     function calcularPrecioProducto(productOrSectionId, anchoCm, largoCm, cantidad, sectionId = null) {
       if ((!productOrSectionId && !sectionId) || !anchoCm) return 0;
+
+      const anchoNum = parseFloat(anchoCm);
+      const largoNum = parseFloat(largoCm);
+      if (!isFinite(anchoNum) || !isFinite(largoNum) || anchoNum <= 0 || largoNum <= 0) {
+        return 0;
+      }
+
+      const cantidadNum = parseInt(cantidad, 10);
+      const cantidadValida = isFinite(cantidadNum) && cantidadNum > 0 ? cantidadNum : 1;
+      const areaCm2 = anchoNum * largoNum;
 
       // productOrSectionId puede ser en realidad un productId si el usuario seleccionó manualmente.
       let product = null;
@@ -1981,35 +2066,45 @@
       
       // Si no es un productId y tenemos sectionId, buscamos el mejor producto en esa sección
       if (!product && sectionId) {
-        product = findBestProductForSection(sectionId, anchoCm, largoCm);
+        product = findBestProductForSection(sectionId, anchoNum, largoNum);
       }
 
-      if (!product) {
-        console.debug('calcularPrecioProducto: no se encontró producto para', { productOrSectionId, sectionId, anchoCm, largoCm });
+      const productNameFromState = (productosCotizacion?.[productoActual]?.productName || '').split('(')[0].trim();
+      const productNameFromOption = newMaterialInput && newMaterialInput.options && newMaterialInput.selectedIndex >= 0
+        ? (newMaterialInput.options[newMaterialInput.selectedIndex].text || '')
+        : '';
+      const candidateNames = [
+        product?.nombre_producto,
+        productNameFromOption,
+        productNameFromState
+      ].filter(Boolean);
+
+      let precioM2 = null;
+      if (sectionId) {
+        precioM2 = getRegistryPriceForProduct(sectionId, areaCm2, candidateNames);
+      }
+
+      if (!isFinite(precioM2) && product) {
+        // Normalizar presion_m2 (aceptar comas como separador decimal, limpiar texto)
+        let precioM2Raw = product.presion_m2;
+        if (precioM2Raw !== undefined && precioM2Raw !== null) {
+          if (typeof precioM2Raw === 'string') {
+            precioM2Raw = precioM2Raw.replace(/\s+/g, '').replace(/\$/g, '').replace(',', '.');
+          }
+          const parsed = parseFloat(precioM2Raw);
+          if (isFinite(parsed)) {
+            precioM2 = parsed;
+          }
+        }
+      }
+
+      if (!isFinite(precioM2)) {
+        console.debug('calcularPrecioProducto: no se pudo determinar precio m2 para', { productOrSectionId, sectionId });
         return 0;
       }
 
-      // Normalizar presion_m2 (aceptar comas como separador decimal, limpiar texto)
-      let precioM2Raw = product.presion_m2;
-      if (precioM2Raw === undefined || precioM2Raw === null) {
-        console.debug('calcularPrecioProducto: producto sin presion_m2', product);
-        return 0;
-      }
-      if (typeof precioM2Raw === 'string') {
-        precioM2Raw = precioM2Raw.replace(/\s+/g, '').replace(/\$/g, '').replace(',', '.');
-      }
-      const precioM2 = parseFloat(precioM2Raw);
-
-      const anchoM = parseFloat(anchoCm) / 100; // Usamos los valores numéricos
-      const largoM = parseFloat(largoCm) / 100;
-      const cantidadNum = parseInt(cantidad) || 1; // --- CORRECCIÓN: Usar 1 por defecto si la cantidad está vacía ---
-
-      if (isNaN(anchoM) || isNaN(largoM) || isNaN(cantidadNum) || isNaN(precioM2)) {
-        console.debug('calcularPrecioProducto: NaN detectado', { anchoM, largoM, cantidadNum, precioM2Raw, precioM2 });
-        return 0;
-      }
-
-      const total = (anchoM * largoM * precioM2 * cantidadNum);
+      const areaM2 = areaCm2 / 10000;
+      const total = areaM2 * precioM2 * cantidadValida;
       return total;
     }
 
