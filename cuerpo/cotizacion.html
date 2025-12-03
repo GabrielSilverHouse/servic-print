@@ -959,15 +959,39 @@
         const productSelect = document.getElementById('newMaterial');
         const selectedProductOption = productSelect.options[productSelect.selectedIndex];
 
+        // Asegurarse de que el producto actual existe en el array
+        if (!productosCotizacion[productoActual]) {
+            productosCotizacion[productoActual] = {
+                category: '', sectionId: '', productId: '', productName: '', ancho: '', largo: '', cantidad: '', precioTotal: 0, descuento: '', nota: ''
+            };
+        }
+
+        // Obtener productName: primero del estado guardado (si existe), luego del dropdown, luego calcular
+        let productName = productosCotizacion[productoActual].productName || '';
+        if (selectedProductOption && selectedProductOption.text) {
+            productName = selectedProductOption.text;
+        } else if (!productName) {
+            // Si no hay productName, intentar calcularlo desde el mejor producto
+            const sectionId = sectionSelect.value;
+            const ancho = document.getElementById('newAncho').value;
+            const largo = document.getElementById('newLargo').value;
+            if (sectionId && ancho && largo) {
+                const bestProduct = findBestProductForSection(sectionId, ancho, largo);
+                if (bestProduct) {
+                    productName = `${bestProduct.nombre_producto} (${bestProduct.medida || 'N/A'})`;
+                }
+            }
+        }
+
         productosCotizacion[productoActual] = {
             category: categorySelect.value,
             sectionId: sectionSelect.value,
-            productId: productSelect.value,
-            productName: selectedProductOption ? selectedProductOption.text : '',
+            productId: productSelect.value || productosCotizacion[productoActual].productId || '',
+            productName: productName,
             ancho: document.getElementById('newAncho').value,
             largo: document.getElementById('newLargo').value,
             cantidad: document.getElementById('newCantidad').value,
-            precioTotal: calcularPrecioProducto(productSelect.value, document.getElementById('newAncho').value, document.getElementById('newLargo').value, document.getElementById('newCantidad').value, sectionSelect.value),
+            precioTotal: calcularPrecioProducto(productSelect.value || productosCotizacion[productoActual].productId, document.getElementById('newAncho').value, document.getElementById('newLargo').value, document.getElementById('newCantidad').value, sectionSelect.value),
             descuento: document.getElementById('newDescuento').value,
             nota: document.getElementById('newNota').value
         };
@@ -1192,6 +1216,27 @@
         // Guardar el producto actual antes de mostrar la previsualización
         guardarProductoActual();
         
+        // Asegurarse de que todos los productos tengan sus datos actualizados
+        productosCotizacion.forEach((prod, idx) => {
+            // Si el producto no tiene productName pero tiene sectionId, calcularlo
+            if (!prod.productName && prod.sectionId && prod.ancho && prod.largo) {
+                const bestProduct = findBestProductForSection(prod.sectionId, prod.ancho, prod.largo);
+                if (bestProduct) {
+                    prod.productName = `${bestProduct.nombre_producto} (${bestProduct.medida || 'N/A'})`;
+                    if (!prod.productId) {
+                        prod.productId = bestProduct.id;
+                    }
+                }
+            }
+            // Si el producto tiene productId pero no productName, intentar obtenerlo del catálogo
+            if (!prod.productName && prod.productId && allCatalogData.products.length > 0) {
+                const productoCatalogo = allCatalogData.products.find(p => String(p.id) === String(prod.productId));
+                if (productoCatalogo) {
+                    prod.productName = `${productoCatalogo.nombre_producto} (${productoCatalogo.medida || 'N/A'})`;
+                }
+            }
+        });
+        
         sidebar.classList.remove('active');
         editSidebar.classList.remove('active');
         previewSidebar.classList.add('active');
@@ -1221,7 +1266,7 @@
                 contact_person: newContactoInput.value,
             },
             correo: newCorreoInput.value,
-            productos: productosCotizacion.filter(prod => prod.productName && prod.cantidad),
+            productos: productosCotizacion.filter(prod => (prod.productName || prod.productId) && (prod.cantidad || prod.cantidad === '0')),
             fecha: new Date().toLocaleDateString('es-CL'),
             receivedTime: (new Date()).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}),
             quoteNumber: quoteNumber
@@ -1802,96 +1847,145 @@
     });
 
     // --- Lógica de búsqueda del mejor producto (restaurada) ---
-    function parseMedidaString(medidaStr) {
-        if (!medidaStr || typeof medidaStr !== 'string') return null;
-        const s = medidaStr.toLowerCase().trim();
-        const cleaned = s.replace(/×|x|X/g, 'x').replace(/\s+/g, ' ');
+  function parseMedidaString(medidaStr) {
+    // Devuelve un objeto con la información posible de la medida:
+    // { type: 'exact'|'hasta'|'desde'|'range', w: number, h: number, w2?: number, h2?: number }
+    if (!medidaStr || typeof medidaStr !== 'string') return null;
+    const s = medidaStr.toLowerCase().trim();
+    const cleaned = s
+      .replace(/cm\.?|cms\.?|centimetros|centímetros|mm\.?|m2|m²|metros|metro/g, '')
+      .replace(/×|x|X/g, 'x')
+      .replace(/\s+/g, ' ');
 
-        const hastaMatch = cleaned.match(/(?:hasta|desde)\s*(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)/);
-        if (hastaMatch) {
-            return { w: parseFloat(hastaMatch[1]), h: parseFloat(hastaMatch[2]) };
-        }
-
-        const exactMatch = cleaned.match(/^(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)/);
-        if (exactMatch) {
-            return { w: parseFloat(exactMatch[1]), h: parseFloat(exactMatch[2]) };
-        }
-        return null;
+    // Buscar patrones tipo "desde 10x20 hasta 30x40"
+    const rangeMatch = cleaned.match(/desde\s*(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*(?:hasta|a|-)\s*(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)/);
+    if (rangeMatch) {
+      return { type: 'range', w: parseFloat(rangeMatch[1]), h: parseFloat(rangeMatch[2]), w2: parseFloat(rangeMatch[3]), h2: parseFloat(rangeMatch[4]) };
     }
 
-    function findBestProductForSection(sectionId, anchoCm, largoCm) {
-        const numAncho = parseFloat(anchoCm) || 0;
-        const numLargo = parseFloat(largoCm) || 0;
+    // Buscar "hasta 50x100" o "desde 10x20"
+    const boundMatch = cleaned.match(/(?:hasta|desde)\s*(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)/);
+    if (boundMatch) {
+      const prefix = cleaned.includes('desde') ? 'desde' : 'hasta';
+      return { type: prefix, w: parseFloat(boundMatch[1]), h: parseFloat(boundMatch[2]) };
+    }
 
-        if (!sectionId || numAncho <= 0 || numLargo <= 0) {
-            return null;
-        }
+    // Match exacto "5x100" o "10 x 20"
+    const exactMatch = cleaned.match(/^(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)/);
+    if (exactMatch) {
+      return { type: 'exact', w: parseFloat(exactMatch[1]), h: parseFloat(exactMatch[2]) };
+    }
 
-      // Filter products by section_id
-      const productsInSection = allCatalogData.products.filter(p => 
-        String(p.section_id) === String(sectionId)
-      );
-      if (productsInSection.length === 0) return null;
+    return null;
+  }
 
-      const targetArea = numAncho * numLargo;
+  // --- CORRECCIÓN: Lógica de búsqueda de producto mejorada para entender dimensiones por separado ---
+  function findBestProductForSection(sectionId, anchoCm, largoCm) {
+    const targetAncho = parseFloat(anchoCm) || 0;
+    const targetLargo = parseFloat(largoCm) || 0;
+    if (!sectionId || targetAncho <= 0 || targetLargo <= 0) {
+      return null;
+    }
 
-      let bestMatch = null;
-      let smallestDifference = Infinity;
+    // Normalizar target (no usar área como único criterio)
+    const targetArea = targetAncho * targetLargo;
 
-      // Primera pasada: buscar producto con area >= target y menor diferencia
-      productsInSection.forEach(product => {
-        const parsedMedida = parseMedidaString(product.medida);
-        if (parsedMedida) {
-          const productArea = parsedMedida.w * parsedMedida.h;
-          if (productArea >= targetArea) {
-            const difference = productArea - targetArea;
-            if (difference < smallestDifference) {
-              smallestDifference = difference;
-              bestMatch = product;
-            }
-          }
-        }
-      });
+    // Construir candidatos con parsing más rico
+    const candidates = allCatalogData.products
+      .filter(p => String(p.section_id) === String(sectionId))
+      .map(product => {
+        const parsed = parseMedidaString(product.medida);
+        const medidaStr = (product.medida || '').toLowerCase();
+        let ruleType = 'exact';
+        if (medidaStr.includes('desde')) ruleType = 'desde';
+        else if (medidaStr.includes('hasta')) ruleType = 'hasta';
 
-      // Si no encontramos ninguno mayor o igual, elegir el producto con area más cercana (mayor posible)
-      if (!bestMatch) {
-        let largestBelow = null;
-        let largestArea = -Infinity;
-        productsInSection.forEach(product => {
-          const parsedMedida = parseMedidaString(product.medida);
-          if (parsedMedida) {
-            const productArea = parsedMedida.w * parsedMedida.h;
-            if (productArea <= targetArea && productArea > largestArea) {
-              largestArea = productArea;
-              largestBelow = product;
-            }
-          }
-        });
-        if (largestBelow) {
-          bestMatch = largestBelow;
-        }
+        const w = parsed && parsed.w ? parsed.w : 0;
+        const h = parsed && parsed.h ? parsed.h : 0;
+        const w2 = parsed && parsed.w2 ? parsed.w2 : null;
+        const h2 = parsed && parsed.h2 ? parsed.h2 : null;
+        const area = (w && h) ? (w * h) : 0;
+
+        return { product, parsed, ruleType, w, h, w2, h2, area };
+      })
+      .filter(c => c.area > 0);
+
+    if (candidates.length === 0) return null;
+
+    // Función que comprueba si un candidato cubre las dimensiones objetivo, permitiendo rotación
+    function coversDimensions(c) {
+      const pw = c.w;
+      const ph = c.h;
+      if (!pw || !ph) return false;
+
+      // Comprobación sin rango: target debe caber dentro del producto (ambas dimensiones <=)
+      const fitsNoRotate = (targetAncho <= pw && targetLargo <= ph);
+      const fitsRotate = (targetAncho <= ph && targetLargo <= pw);
+      return fitsNoRotate || fitsRotate;
+    }
+
+    // Filtrar candidatos válidos según tipo:
+    const valid = candidates.filter(c => {
+      if (!c.parsed) return false;
+      if (c.parsed.type === 'range') {
+        // Debe estar entre los dos pares (permitir rotación en la verificación)
+        const minW = Math.min(c.w, c.w2);
+        const maxW = Math.max(c.w, c.w2);
+        const minH = Math.min(c.h, c.h2);
+        const maxH = Math.max(c.h, c.h2);
+        const fits = (targetAncho >= minW && targetAncho <= maxW && targetLargo >= minH && targetLargo <= maxH) ||
+               (targetAncho >= minH && targetAncho <= maxH && targetLargo >= minW && targetLargo <= maxW);
+        return fits;
       }
+      if (c.ruleType === 'hasta') {
+        // El target debe caber dentro de las dimensiones máximas del producto
+        return coversDimensions(c);
+      }
+      if (c.ruleType === 'desde') {
+        // El target debe ser mayor o igual a las dimensiones mínimas indicadas
+        const minFitsNoRotate = (targetAncho >= c.w && targetLargo >= c.h);
+        const minFitsRotate = (targetAncho >= c.h && targetLargo >= c.w);
+        return minFitsNoRotate || minFitsRotate;
+      }
+      // exact o fallback: aceptar si target cabe en el producto
+      return coversDimensions(c);
+    });
 
-      return bestMatch;
+    if (valid.length === 0) {
+      // Fallback: devolver el producto con area más cercana pero que en lo posible cubra al menos por área
+      candidates.sort((a, b) => Math.abs(a.area - targetArea) - Math.abs(b.area - targetArea));
+      return candidates[0].product;
     }
+
+    // Ordenar validos por prioridad: que cubran sin rotación primero, luego por área más cercana
+    valid.sort((a, b) => {
+      const aNoRot = (targetAncho <= a.w && targetLargo <= a.h) || (targetAncho <= a.h && targetLargo <= a.w);
+      const bNoRot = (targetAncho <= b.w && targetLargo <= b.h) || (targetAncho <= b.h && targetLargo <= b.w);
+      if (aNoRot && !bNoRot) return -1;
+      if (!aNoRot && bNoRot) return 1;
+      return Math.abs(a.area - targetArea) - Math.abs(b.area - targetArea);
+    });
+
+    return valid[0].product;
+  }
 
     // --- CORRECCIÓN: La función ahora busca el mejor producto automáticamente ---
     function calcularPrecioProducto(productOrSectionId, anchoCm, largoCm, cantidad, sectionId = null) {
-      if (!productOrSectionId && !anchoCm) return 0;
+      if ((!productOrSectionId && !sectionId) || !anchoCm) return 0;
 
       // productOrSectionId puede ser en realidad un productId si el usuario seleccionó manualmente.
       let product = null;
       if (allCatalogData && Array.isArray(allCatalogData.products)) {
         product = allCatalogData.products.find(p => String(p.id) === String(productOrSectionId));
       }
-
+      
       // Si no es un productId y tenemos sectionId, buscamos el mejor producto en esa sección
       if (!product && sectionId) {
         product = findBestProductForSection(sectionId, anchoCm, largoCm);
       }
 
       if (!product) {
-        console.debug('calcularPrecioProducto: no se encontró producto para', { categoryId, anchoCm, largoCm });
+        console.debug('calcularPrecioProducto: no se encontró producto para', { productOrSectionId, sectionId, anchoCm, largoCm });
         return 0;
       }
 
@@ -1921,32 +2015,42 @@
 
     // --- NUEVA FUNCIÓN CENTRAL PARA RECALCULAR ---
     function recalculateAndPreviewCurrentProduct() {
-        const categoryId = newMaterialCategoryInput.value;
         const ancho = newAnchoInput.value;
         const largo = newLargoInput.value;
         const cantidad = newCantidadInput.value;
         const sectionId = newMaterialSectionInput.value;
 
-        // 1. Encontrar el mejor producto (si hay sección seleccionada)
-        let bestProduct = null;
-        if (sectionId) {
-            bestProduct = findBestProductForSection(sectionId, ancho, largo);
-        }
+    // 1. Preferir el producto seleccionado manualmente por el usuario (si existe)
+    let selectedProductId = newMaterialInput.value || null;
+    let selectedProduct = null;
+    if (selectedProductId && allCatalogData && Array.isArray(allCatalogData.products)) {
+      selectedProduct = allCatalogData.products.find(p => String(p.id) === String(selectedProductId)) || null;
+    }
 
-        // 2. Calcular el precio
-        const productId = bestProduct ? bestProduct.id : null;
-        const precioTotal = calcularPrecioProducto(productId, ancho, largo, cantidad, sectionId);
+    // 2. Si no hay producto seleccionado manualmente, intentar encontrar el mejor producto según sección y medidas
+    let bestProduct = null;
+    if (!selectedProduct && sectionId) {
+      bestProduct = findBestProductForSection(sectionId, ancho, largo);
+    }
 
-        // 3. Actualizar el estado del producto actual en la cotización
-        if (productosCotizacion[productoActual]) {
-            productosCotizacion[productoActual].productId = productId || (bestProduct ? bestProduct.id : null);
-            if (productId && newMaterialInput.options[newMaterialInput.selectedIndex]) {
-                productosCotizacion[productoActual].productName = newMaterialInput.options[newMaterialInput.selectedIndex].text;
-            } else {
-                productosCotizacion[productoActual].productName = bestProduct ? `${bestProduct.nombre_producto} (${bestProduct.medida || 'N/A'})` : 'Producto no encontrado';
-            }
-            productosCotizacion[productoActual].precioTotal = precioTotal;
-        }
+    // 3. Determinar qué producto usar para calcular precio (manual > automático)
+    const productToUse = selectedProduct || bestProduct || null;
+    const productId = productToUse ? productToUse.id : null;
+    const precioTotal = calcularPrecioProducto(productId, ancho, largo, cantidad, sectionId);
+
+    // 4. Actualizar el estado del producto actual en la cotización
+    if (productosCotizacion[productoActual]) {
+      productosCotizacion[productoActual].productId = productId || '';
+      // Preferir mostrar el texto del select si el usuario eligió manualmente
+      if (selectedProduct && newMaterialInput.options && newMaterialInput.selectedIndex >= 0) {
+        productosCotizacion[productoActual].productName = newMaterialInput.options[newMaterialInput.selectedIndex].text;
+      } else if (productToUse) {
+        productosCotizacion[productoActual].productName = `${productToUse.nombre_producto || productToUse.producto || ''} (${productToUse.medida || 'N/A'})`;
+      } else {
+        productosCotizacion[productoActual].productName = 'Producto no encontrado';
+      }
+      productosCotizacion[productoActual].precioTotal = precioTotal;
+    }
 
         // 4. Actualizar la UI (ej. un campo de previsualización de precio si lo tuvieras)
         // Por ahora, lo más importante es que el estado `productosCotizacion` esté correcto
@@ -2706,12 +2810,20 @@
         newTelefonoInput.value = '';
         newCorreoInput.value = '';
         newMaterialCategoryInput.value = '';
-        newMaterialInput.style.display = 'none';
+    // Reset selects and inputs visibles
+    newMaterialInput.style.display = 'none';
         newContactoInput.value = '';
         newMaterialInput.value = '';
         newAnchoInput.value = '';
         newLargoInput.value = '';
         newCantidadInput.value = '';
+    newDescuentoInput.value = '';
+    newNotaInput.value = '';
+    // Reset section/product selects
+    newMaterialSectionInput.innerHTML = '<option value="">2. Seleccione un grupo...</option>';
+    newMaterialSectionInput.style.display = 'none';
+    newMaterialInput.innerHTML = '<option value="">3. Producto (Automático)</option>';
+    newMaterialInput.style.display = 'none';
         
         // Resetear la lista de productos
         productosCotizacion = [{
@@ -2726,6 +2838,13 @@
             nota: ''
         }];
         productoActual = 0;
+    // Re-render product tabs and cargar producto actual para actualizar la UI
+    try {
+      renderProductTabs();
+      cargarProductoActual();
+    } catch (err) {
+      console.debug('resetNewSaleForm: error re-rendering product tabs', err);
+    }
     }
 
     // --- Lógica de Impresión (safe - evita múltiples diálogos) ---
